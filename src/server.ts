@@ -5,7 +5,6 @@ import dotenv from 'dotenv';
 import { Server as SocketIOServer } from 'socket.io';
 import { PresageService } from './services/PresageService';
 import { GeminiService } from './services/GeminiService';
-import { PaymentService } from './services/PaymentService';
 
 dotenv.config();
 
@@ -19,7 +18,7 @@ app.use(
     credentials: true,
   })
 );
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '1mb' }));
 
 const server = http.createServer(app);
 const io = new SocketIOServer(server, {
@@ -32,7 +31,9 @@ const io = new SocketIOServer(server, {
 
 const presageService = new PresageService();
 const geminiService = new GeminiService();
-const paymentService = new PaymentService();
+
+// Simple in-memory rate limit for /api/triage (max 10 requests per minute per IP)
+const triageRateMap = new Map<string, number[]>();
 
 // Health & SDK Diagnostics Endpoint
 app.get('/api/health', (_req, res) => {
@@ -41,38 +42,37 @@ app.get('/api/health', (_req, res) => {
     service: 'VitalSync Tele-Triage Kiosk Backend',
     presage: presageService.getStatus(),
     geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
-    privacyPolicy: 'Zero-disk-retention ephemeral RAM pipeline active',
+    privacyPolicy: 'Ephemeral in-memory processing • SDK aggregate telemetry disabled',
   });
 });
 
-// REST fallback for Triage Generation
+// Validated & Rate-Limited REST fallback for Triage Generation
 app.post('/api/triage', async (req, res) => {
+  const ip = req.ip || 'local';
+  const now = Date.now();
+  const recent = (triageRateMap.get(ip) || []).filter((t) => now - t < 60_000);
+  if (recent.length >= 10) {
+    res.status(429).json({ error: 'Too many triage requests. Please wait a moment.' });
+    return;
+  }
+  recent.push(now);
+  triageRateMap.set(ip, recent);
+
+  const body = req.body;
+  if (!body || typeof body.avgPulseRate !== 'number' || typeof body.chiefComplaint !== 'string') {
+    res.status(400).json({ error: 'Invalid session summary payload' });
+    return;
+  }
+
   try {
-    const report = await geminiService.generateTriageReport(req.body);
+    const sanitizedSummary = {
+      ...body,
+      chiefComplaint: String(body.chiefComplaint).slice(0, 240),
+    };
+    const report = await geminiService.generateTriageReport(sanitizedSummary);
     res.json(report);
   } catch (err: any) {
     res.status(500).json({ error: err?.message || 'Failed to generate triage report' });
-  }
-});
-
-// MTN Mobile Money (MoMo) Payment Endpoint
-app.post('/api/payments/momo', async (req, res) => {
-  try {
-    const { phone, country } = req.body || {};
-    const receipt = await paymentService.processMtnMomo(phone, country);
-    res.json(receipt);
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'MoMo payment failed' });
-  }
-});
-
-// Stripe Express Checkout Endpoint
-app.post('/api/payments/stripe', async (_req, res) => {
-  try {
-    const receipt = await paymentService.processStripeCheckout(FRONTEND_URL);
-    res.json(receipt);
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Stripe checkout failed' });
   }
 });
 
@@ -83,11 +83,14 @@ io.on('connection', (socket) => {
   socket.on(
     'session:start',
     async (options: { mode?: 'webcam' | 'demo'; chiefComplaint?: string }) => {
+      const safeComplaint = String(
+        options?.chiefComplaint || 'Routine Pre-Consultation Check-In'
+      ).slice(0, 240);
       await presageService.startSession(
         socket.id,
         {
-          mode: options?.mode || 'webcam',
-          chiefComplaint: options?.chiefComplaint || 'Routine Tele-Triage Checkup',
+          mode: options?.mode === 'demo' ? 'demo' : 'webcam',
+          chiefComplaint: safeComplaint,
         },
         (vitalPacket) => {
           socket.emit('stream:vitals', vitalPacket);
@@ -135,4 +138,3 @@ io.on('connection', (socket) => {
 server.listen(PORT, () => {
   console.log(`🩺 VitalSync Backend listening on http://localhost:${PORT}`);
 });
-

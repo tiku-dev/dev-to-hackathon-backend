@@ -18,35 +18,37 @@ class GeminiService {
             try {
                 this.ai = new genai_1.GoogleGenAI({ apiKey });
             }
-            catch (err) {
-                console.warn('[GeminiService] Initialized with clinical synthesis fallback');
+            catch {
+                console.warn('[GeminiService] Initialized with rule-based summary fallback');
             }
         }
     }
     async generateTriageReport(summary) {
         if (this.ai) {
             try {
-                const prompt = `You are a clinical tele-triage AI assistant evaluating non-diagnostic contactless vital signs captured via the Presage SmartSpectra SDK.
+                const prompt = `You are a non-diagnostic pre-consultation wellness & physiological intake assistant summarizing contactless optical signals captured via the Presage SmartSpectra SDK.
+IMPORTANT RULES:
+- Do NOT diagnose any medical condition or recommend medical treatment.
+- Frame all observations as neutral, non-diagnostic physiological context for the patient and their clinician.
+- Report exact numbers from the input without inventing changes.
 
-Patient Intake & Physiological Telemetry:
+Session Telemetry Summary:
 ${JSON.stringify(summary, null, 2)}
 
 Return ONLY a valid JSON object matching this exact structure:
 {
-  "triagePriority": "Routine" | "Moderate / Stress-Elevated" | "Priority Clinical Review",
-  "autonomicState": "1-sentence description of sympathetic vs parasympathetic balance based on HR, HRV, breathing rate, and phasic stress",
-  "patientSummary": "2-3 warm, reassuring, non-diagnostic sentences for the patient explaining their vitals and readiness for the doctor",
+  "observationLevel": "Steady Baseline" | "Elevated Sympathetic Arousal Observed" | "Notable Physiological Variance — Discuss with Clinician",
+  "autonomicState": "1-sentence neutral observation of pulse (${summary.avgPulseRate} BPM), RMSSD HRV (${summary.avgHrv} ms), and breathing rate (${summary.avgBreathingRate} RPM)",
+  "patientSummary": "2-3 warm, reassuring, strictly non-diagnostic sentences summarizing the recorded signals for the user",
   "clinicianSbar": {
-    "situation": "Chief complaint and immediate vital sign headline",
-    "background": "30s contactless SmartSpectra rPPG scan context and signal quality (${summary.avgSignalQuality}%)",
-    "assessment": "Detailed physiological correlation of HR (${summary.avgPulseRate} BPM), HRV (${summary.avgHrv} ms), Breathing (${summary.avgBreathingRate} RPM), and EDA stress (${summary.avgPhasicStress}/100)",
-    "recommendation": "Actionable pre-consultation focus for the physician"
+    "situation": "Visit reason and recorded baseline vital sign headline",
+    "background": "${summary.scanDurationSeconds}s SmartSpectra scan (${summary.isSimulated ? 'Simulated Demo Mode' : 'Live Optical Capture'}, mean SQI ${summary.avgSignalQuality}%)",
+    "assessment": "Neutral summary of pulse (${summary.avgPulseRate} BPM), HRV RMSSD (${summary.avgHrv} ms), breathing (${summary.avgBreathingRate} RPM), and inhale/exhale ratio (${summary.avgInhaleExhaleRatio ?? 'N/A'})",
+    "recommendation": "Non-diagnostic pre-consultation intake context to discuss during the visit"
   },
-  "coRegulationAnalysis": "Analysis of how the patient responded to the 15s guided breathing biofeedback (or note if not performed)",
+  "coRegulationAnalysis": "Exact comparison of pre- vs post-paced-breathing values if coRegulationPerformed is true, or note that paced breathing was not used",
   "suggestedQuestions": ["Question 1", "Question 2", "Question 3"]
 }`;
-                // Free-tier friendly Gemini 2.x chain. Override the first choice with GEMINI_MODEL in .env.
-                // A model that returns 404 (retired / not available to this key) is skipped for later requests.
                 const candidates = [
                     this.workingModel,
                     process.env.GEMINI_MODEL,
@@ -88,76 +90,71 @@ Return ONLY a valid JSON object matching this exact structure:
                     return {
                         generatedAt: new Date().toISOString(),
                         aiEngine: `Google ${usedModel} (@google/genai)`,
-                        triagePriority: parsed.triagePriority || 'Routine',
+                        isSimulatedData: Boolean(summary.isSimulated),
+                        observationLevel: parsed.observationLevel || 'Steady Baseline',
                         autonomicState: parsed.autonomicState,
                         patientSummary: parsed.patientSummary,
                         clinicianSbar: parsed.clinicianSbar,
                         coRegulationAnalysis: parsed.coRegulationAnalysis,
                         suggestedQuestions: parsed.suggestedQuestions || [],
-                        disclaimer: 'Non-diagnostic physiological pre-screening generated via Presage SmartSpectra contactless sensing and Gemini AI. For clinical decision support only.',
+                        disclaimer: 'Not a medical device. This summary provides non-diagnostic physiological observations captured via Presage SmartSpectra and formatted by Google Gemini for informational pre-consultation context only.',
                     };
                 }
             }
             catch (err) {
-                console.warn('[GeminiService] Live API call fell back to deterministic clinical SBAR synthesizer:', err?.message || err);
+                console.warn('[GeminiService] Live API call fell back to rule-based summary:', err?.message || err);
             }
         }
-        return this.buildDeterministicClinicalReport(summary);
+        return this.buildRuleBasedReport(summary);
     }
-    buildDeterministicClinicalReport(summary) {
-        const isElevated = summary.avgPulseRate >= 90 || summary.avgPhasicStress >= 60 || summary.avgHrv < 35;
-        const isPriority = summary.avgPulseRate >= 102 || summary.avgBreathingRate >= 22;
-        const triagePriority = isPriority
-            ? 'Priority Clinical Review'
+    buildRuleBasedReport(summary) {
+        const isElevated = summary.avgPulseRate >= 90 || summary.avgHrv < 35;
+        const isNotable = summary.avgPulseRate >= 102 || summary.avgBreathingRate >= 22;
+        const observationLevel = isNotable
+            ? 'Notable Physiological Variance — Discuss with Clinician'
             : isElevated
-                ? 'Moderate / Stress-Elevated'
-                : 'Routine';
+                ? 'Elevated Sympathetic Arousal Observed'
+                : 'Steady Baseline';
         const hrDelta = summary.coRegulationPerformed &&
             summary.preCoRegPulse !== undefined &&
             summary.postCoRegPulse !== undefined
-            ? summary.preCoRegPulse - summary.postCoRegPulse
-            : 0;
+            ? summary.postCoRegPulse - summary.preCoRegPulse
+            : null;
         const hrvDelta = summary.coRegulationPerformed &&
             summary.preCoRegHrv !== undefined &&
             summary.postCoRegHrv !== undefined
             ? summary.postCoRegHrv - summary.preCoRegHrv
-            : 0;
-        const autonomicState = isElevated
-            ? `Mild sympathetic dominance (HR ${summary.avgPulseRate} BPM, HRV ${summary.avgHrv} ms, Phasic EDA ${summary.avgPhasicStress}/100) consistent with pre-consultation anticipatory stress.`
-            : `Balanced vagal/parasympathetic tone (HR ${summary.avgPulseRate} BPM, HRV ${summary.avgHrv} ms, Respiratory ${summary.avgBreathingRate} RPM) with stable cardiac plethysmography.`;
-        const patientSummary = summary.coRegulationPerformed
-            ? `Your contactless vital scan is complete with ${summary.avgSignalQuality}% optical signal quality. While your initial pulse showed mild pre-visit tension, the 15-second guided breathing exercise helped lower your heart rate by ${Math.max(2, hrDelta)} BPM and improved heart rate variability before seeing your doctor.`
-            : `Your contactless vital scan is complete with ${summary.avgSignalQuality}% optical signal quality. Your resting pulse averaged ${summary.avgPulseRate} BPM with a steady breathing rate of ${summary.avgBreathingRate} breaths per minute, and your summary has been attached to your physician's chart.`;
-        const coRegulationAnalysis = summary.coRegulationPerformed
-            ? `Patient completed 15s SmartSpectra-synced respiratory biofeedback (0.1 Hz paced breathing). Heart rate shifted from ${summary.preCoRegPulse} BPM → ${summary.postCoRegPulse} BPM (Δ -${Math.max(1, hrDelta)} BPM) and RMSSD HRV improved from ${summary.preCoRegHrv} ms → ${summary.postCoRegHrv} ms (+${Math.max(1, hrvDelta)} ms), suggesting reversible situational ("white-coat") sympathetic arousal rather than fixedresting tachycardia.`
-            : `Guided respiratory co-regulation was not triggered during this intake window. Baseline metrics reflect unmodulated resting state over ${summary.scanDurationSeconds}s.`;
+            : null;
+        const sourceLabel = summary.isSimulated
+            ? 'Simulated Demo Mode'
+            : 'Live SmartSpectra Optical Capture';
+        const autonomicState = `Observed mean pulse of ${summary.avgPulseRate} BPM (range ${summary.minPulseRate}–${summary.maxPulseRate} BPM), RMSSD HRV of ${summary.avgHrv} ms, and breathing rate of ${summary.avgBreathingRate} RPM (${sourceLabel}).`;
+        const patientSummary = summary.coRegulationPerformed && hrDelta !== null
+            ? `Your ${summary.scanDurationSeconds}-second pre-consultation scan (${sourceLabel}, ${summary.avgSignalQuality}% signal quality) recorded an average pulse of ${summary.avgPulseRate} BPM and breathing rate of ${summary.avgBreathingRate} breaths per minute. During the 15-second paced breathing exercise, your pulse moved from ${summary.preCoRegPulse} BPM to ${summary.postCoRegPulse} BPM (${hrDelta >= 0 ? `+${hrDelta}` : hrDelta} BPM).`
+            : `Your ${summary.scanDurationSeconds}-second pre-consultation scan (${sourceLabel}, ${summary.avgSignalQuality}% signal quality) recorded an average pulse of ${summary.avgPulseRate} BPM, HRV (RMSSD) of ${summary.avgHrv} ms, and a breathing rate of ${summary.avgBreathingRate} breaths per minute.`;
+        const coRegulationAnalysis = summary.coRegulationPerformed && hrDelta !== null && hrvDelta !== null
+            ? `15s paced breathing completed (0.1 Hz guide). Pulse changed from ${summary.preCoRegPulse} BPM to ${summary.postCoRegPulse} BPM (Δ ${hrDelta >= 0 ? `+${hrDelta}` : hrDelta} BPM); RMSSD HRV changed from ${summary.preCoRegHrv} ms to ${summary.postCoRegHrv} ms (Δ ${hrvDelta >= 0 ? `+${hrvDelta}` : hrvDelta} ms); breathing rate shifted from ${summary.preCoRegBreathing} RPM to ${summary.postCoRegBreathing} RPM.`
+            : `Guided paced breathing was not activated during this ${summary.scanDurationSeconds}s session.`;
         return {
             generatedAt: new Date().toISOString(),
             aiEngine: 'Rule-based summary (Gemini unavailable)',
-            triagePriority,
+            isSimulatedData: Boolean(summary.isSimulated),
+            observationLevel,
             autonomicState,
             patientSummary,
             clinicianSbar: {
-                situation: `Patient presenting at tele-triage kiosk for "${summary.chiefComplaint}". Mean HR ${summary.avgPulseRate} BPM (range ${summary.minPulseRate}–${summary.maxPulseRate} BPM), Respiratory Rate ${summary.avgBreathingRate} RPM.`,
-                background: `Contactless optical rPPG & thoracic excursion scan captured over ${summary.scanDurationSeconds}s via Presage SmartSpectra SDK (mean SQI ${summary.avgSignalQuality}%, speech artifact frames: ${summary.talkingEventsCount}).`,
-                assessment: `HRV (RMSSD) measured at ${summary.avgHrv} ms with Phasic EDA stress index of ${summary.avgPhasicStress}/100. ${summary.coRegulationPerformed
-                    ? `Rapid vagal rebound during paced breathing (+${Math.max(1, hrvDelta)} ms HRV) points toward benign anticipatory anxiety.`
-                    : isElevated
-                        ? 'Mildly reduced HRV and elevated sympathetic index warrant correlation with symptom onset.'
-                        : 'Cardiorespiratory oscillations are within normal physiological baseline.'}`,
-                recommendation: isElevated
-                    ? 'Review pre/post biofeedback trend, confirm symptom duration and orthostatic triggers, and repeat spot pulse check at end of consultation.'
-                    : 'Proceed with standard virtual consultation; baseline cardiorespiratory telemetry shows no acute hemodynamic distress.',
+                situation: `Pre-consultation check-in for "${summary.chiefComplaint}". Mean pulse ${summary.avgPulseRate} BPM (range ${summary.minPulseRate}–${summary.maxPulseRate} BPM), breathing rate ${summary.avgBreathingRate} RPM.`,
+                background: `${summary.scanDurationSeconds}s contactless scan (${sourceLabel}, mean SQI ${summary.avgSignalQuality}%, speech artifact frames: ${summary.talkingEventsCount}).`,
+                assessment: `RMSSD HRV recorded at ${summary.avgHrv} ms; inhale/exhale ratio ${summary.avgInhaleExhaleRatio ?? 'N/A'}. ${coRegulationAnalysis}`,
+                recommendation: 'Review these non-diagnostic baseline observations alongside the patient’s self-reported visit context during the consultation.',
             },
             coRegulationAnalysis,
             suggestedQuestions: [
-                `Regarding your "${summary.chiefComplaint}", when did you first notice these symptoms and do they change with posture or exertion?`,
-                isElevated
-                    ? 'Did you feel your chest or breathing relax during the 15-second guided breathing exercise at the kiosk?'
-                    : 'Have you experienced any episodes of unexplained racing heart or shortness of breath over the past 7 days?',
-                'Are you currently taking any medications, caffeine, or supplements that affect heart rate or blood pressure?',
+                `Regarding "${summary.chiefComplaint}", when did you first notice this and what seems to make it better or worse?`,
+                'How does your current resting energy or breathing feel compared to your typical day-to-day baseline?',
+                'Have you recently had caffeine, strenuous exercise, or changes in sleep that might influence your resting pulse?',
             ],
-            disclaimer: 'Non-diagnostic physiological pre-screening generated via Presage SmartSpectra contactless sensing and Gemini AI. For clinical decision support only.',
+            disclaimer: 'Not a medical device. This summary provides non-diagnostic physiological observations captured via Presage SmartSpectra for informational pre-consultation context only.',
         };
     }
 }

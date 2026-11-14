@@ -4,31 +4,36 @@ import path from 'path';
 export interface VitalTelemetryPacket {
   timestampUs: number;
   elapsedSeconds: number;
-  engineSource: 'smartspectra-sdk-live' | 'smartspectra-hybrid-optical' | 'smartspectra-clinical-demo';
-  pulseRate: number;           // BPM
-  hrv: number;                 // RMSSD in ms
-  breathingRate: number;       // Breaths per minute (RPM)
-  ppgWaveform: number;         // Normalized plethysmograph [-1.0 to 1.5]
-  breathingTrace: number;      // Upper chest excursion [-1.0 to 1.0]
-  phasicStress: number;        // EDA autonomic stress index [0 to 100]
-  signalQuality: number;       // SQI [0 to 100%]
-  isTalking: boolean;          // Detected from faceMetrics.talking or lower-face motion
-  blinkDetected: boolean;      // Detected from faceMetrics.blinking
-  motionArtifact: boolean;     // High frame-to-frame motion warning
-  coRegulating: boolean;       // Whether guided breathing biofeedback is active
-  guidanceMessage: string;     // Real-time human-sensing feedback
+  engineSource: 'smartspectra-sdk-live' | 'smartspectra-simulated-demo';
+  isSimulated: boolean;
+  pulseRate: number | null;
+  pulseConfidence: number | null;
+  hrv: number | null;                  // RMSSD in ms (cardio.hrv[].rmssd)
+  breathingRate: number | null;        // Breaths per minute (breathing.rate[].value)
+  arterialWaveform: number;            // cardio.arterialPressureTrace[].value
+  breathingTrace: number;              // breathing.upperTrace[].value
+  inhaleExhaleRatio: number | null;    // breathing.inhaleExhaleRatio[].value
+  signalQuality: number;               // SQI [0 to 100%]
+  isTalking: boolean;                  // face.talking[].detected
+  blinkDetected: boolean;              // face.blinking[].detected
+  motionArtifact: boolean;
+  validationHint: string | null;       // Official SDK validationStatus hint
+  coRegulating: boolean;
+  coRegRemainingSeconds: number;
+  guidanceMessage: string;
 }
 
 export interface SessionBaselineSummary {
   chiefComplaint: string;
   scanDurationSeconds: number;
-  engineSource: string;
+  engineSource: 'smartspectra-sdk-live' | 'smartspectra-simulated-demo';
+  isSimulated: boolean;
   avgPulseRate: number;
   minPulseRate: number;
   maxPulseRate: number;
   avgHrv: number;
   avgBreathingRate: number;
-  avgPhasicStress: number;
+  avgInhaleExhaleRatio: number | null;
   avgSignalQuality: number;
   talkingEventsCount: number;
   coRegulationPerformed: boolean;
@@ -47,11 +52,15 @@ interface SessionState {
   startTimeMs: number;
   coRegulating: boolean;
   coRegStartTimeMs?: number;
+  coRegCompleted: boolean;
   preCoRegSnapshot?: { pulse: number; hrv: number; breathing: number };
+  postCoRegSnapshot?: { pulse: number; hrv: number; breathing: number };
   sdkInstance: any | null;
   sdkActive: boolean;
   lastSdkMetricTimeMs: number;
   lastFrameTimestampUs: number;
+  isProcessingFrame: boolean;
+  validationCode: number;
   validationHint: string | null;
   prevFrameGreenMean: number | null;
   prevFrameRedMean: number | null;
@@ -59,11 +68,14 @@ interface SessionState {
   talkingSimulatedOrDetected: boolean;
   latestSdkValues: {
     pulseRate: number | null;
-    hrv: number | null;
+    pulseConfidence: number | null;
+    pulseStable: boolean;
+    hrvRmssd: number | null;
     breathingRate: number | null;
-    ppgWaveform: number | null;
+    breathingStable: boolean;
+    arterialWaveform: number | null;
     breathingTrace: number | null;
-    phasicStress: number | null;
+    inhaleExhaleRatio: number | null;
     isTalking: boolean;
     blinkDetected: boolean;
   };
@@ -90,17 +102,16 @@ export class PresageService {
       if (process.env.PATH && !process.env.PATH.includes(winBinPath)) {
         process.env.PATH = `${winBinPath}${path.delimiter}${process.env.PATH}`;
       }
-      // Dynamically load @smartspectra/node-sdk so backend boots on any OS/Node architecture
       const mod = await import('@smartspectra/node-sdk');
       this.smartSpectraModule = mod;
       this.sdkLoadStatus = 'loaded';
-      this.sdkLoadDetail = '@smartspectra/node-sdk v3.4.0 native bindings active';
-      console.log('[PresageService] ✅ Loaded @smartspectra/node-sdk successfully');
-    } catch (err: any) {
-      this.sdkLoadStatus = 'loaded';
-      this.sdkLoadDetail =
-        '@smartspectra/node-sdk v3.4.0 installed • Hybrid Optical rPPG + SmartSpectra Telemetry Pipeline Active';
+      this.sdkLoadDetail = `@smartspectra/node-sdk v${mod.SmartSpectraSDK?.version || '3.4.0'} native bindings loaded`;
       console.log('[PresageService] ✅', this.sdkLoadDetail);
+    } catch (err: any) {
+      this.sdkLoadStatus = 'fallback';
+      const reason = err?.message?.split('\n')[0] || 'native addon unavailable';
+      this.sdkLoadDetail = `Native C++ SDK unavailable (${reason}) — Demo Simulation Mode available`;
+      console.warn('[PresageService] ⚠️', this.sdkLoadDetail);
     }
   }
 
@@ -122,13 +133,16 @@ export class PresageService {
     const state: SessionState = {
       socketId,
       mode: options.mode,
-      chiefComplaint: options.chiefComplaint || 'General Tele-Triage Checkup',
+      chiefComplaint: options.chiefComplaint || 'General Pre-Consultation Check-In',
       startTimeMs: Date.now(),
       coRegulating: false,
+      coRegCompleted: false,
       sdkInstance: null,
       sdkActive: false,
       lastSdkMetricTimeMs: 0,
       lastFrameTimestampUs: Date.now() * 1000,
+      isProcessingFrame: false,
+      validationCode: 0,
       validationHint: null,
       prevFrameGreenMean: null,
       prevFrameRedMean: null,
@@ -136,18 +150,20 @@ export class PresageService {
       talkingSimulatedOrDetected: false,
       latestSdkValues: {
         pulseRate: null,
-        hrv: null,
+        pulseConfidence: null,
+        pulseStable: false,
+        hrvRmssd: null,
         breathingRate: null,
-        ppgWaveform: null,
+        breathingStable: false,
+        arterialWaveform: null,
         breathingTrace: null,
-        phasicStress: null,
+        inhaleExhaleRatio: null,
         isTalking: false,
         blinkDetected: false,
       },
       history: [],
     };
 
-    // Attempt to instantiate native SmartSpectraSDK when in webcam mode and module is available
     if (options.mode === 'webcam' && this.smartSpectraModule && process.env.PRESAGE_API_KEY) {
       try {
         const {
@@ -155,7 +171,6 @@ export class PresageService {
           breathingMetrics,
           cardioMetrics,
           faceMetrics,
-          edaMetrics,
           decodeMetrics,
           FrameTransform,
         } = this.smartSpectraModule;
@@ -164,11 +179,11 @@ export class PresageService {
           ...(breathingMetrics || []),
           ...(cardioMetrics || []),
           ...(faceMetrics || []),
-          ...(edaMetrics || []),
         ];
 
         const sdk = new SmartSpectraSDK({
           apiKey: process.env.PRESAGE_API_KEY,
+          enableTelemetry: false, // Opt out of aggregate SDK telemetry for patient privacy
           ...(requestedMetrics.length > 0 ? { requestedMetrics } : {}),
         });
 
@@ -177,64 +192,101 @@ export class PresageService {
         }
 
         sdk.on('validationStatus', (code: number, _ts: number, hint: string) => {
+          state.validationCode = code;
           state.validationHint = code === 0 ? null : hint || null;
         });
 
         sdk.on('error', (code: number, message: string) => {
-          console.warn(`[PresageService] SDK event warning (code ${code}): ${message}`);
+          console.warn(`[PresageService] SDK warning (code ${code}): ${message}`);
         });
 
         sdk.on('metrics', (buffer: Buffer) => {
           try {
-            const decoded = decodeMetrics ? decodeMetrics(buffer) : buffer;
+            const decoded: any = decodeMetrics ? decodeMetrics(buffer) : buffer;
             if (!decoded || Buffer.isBuffer(decoded)) return;
 
             state.lastSdkMetricTimeMs = Date.now();
             state.sdkActive = true;
 
-            const latestPulse = decoded.cardio?.pulseRate?.at?.(-1)?.value;
-            const latestHrv = decoded.cardio?.hrv?.at?.(-1)?.value;
-            const latestPleth = decoded.cardio?.pleth?.at?.(-1)?.value;
-            const latestBreathRate = decoded.breathing?.rate?.at?.(-1)?.value;
-            const latestBreathTrace = decoded.breathing?.upperTrace?.at?.(-1)?.value;
-            const latestTalking = decoded.face?.talking?.at?.(-1)?.value;
-            const latestBlinking = decoded.face?.blinking?.at?.(-1)?.value;
-            const latestPhasic = decoded.eda?.phasic?.at?.(-1)?.value;
+            // Exact protobuf field mappings from @smartspectra/node-sdk/js/messages/generated.d.ts:
+            // ICardio: pulseRate (IMeasurementWithConfidence[]), arterialPressureTrace (IMeasurementWithConfidence[]), hrv (IHrv[])
+            const latestPulseObj = decoded.cardio?.pulseRate?.at?.(-1);
+            const latestArterialObj = decoded.cardio?.arterialPressureTrace?.at?.(-1);
+            const latestHrvObj = decoded.cardio?.hrv?.at?.(-1);
 
-            if (typeof latestPulse === 'number') state.latestSdkValues.pulseRate = Math.round(latestPulse);
-            if (typeof latestHrv === 'number') state.latestSdkValues.hrv = Math.round(latestHrv);
-            if (typeof latestPleth === 'number') state.latestSdkValues.ppgWaveform = Number(latestPleth.toFixed(3));
-            if (typeof latestBreathRate === 'number') state.latestSdkValues.breathingRate = Math.round(latestBreathRate);
-            if (typeof latestBreathTrace === 'number') state.latestSdkValues.breathingTrace = Number(latestBreathTrace.toFixed(3));
-            if (typeof latestTalking === 'boolean') state.latestSdkValues.isTalking = latestTalking;
-            if (typeof latestBlinking === 'boolean') state.latestSdkValues.blinkDetected = latestBlinking;
-            if (typeof latestPhasic === 'number') state.latestSdkValues.phasicStress = Math.round(latestPhasic);
-          } catch (decodeErr) {
-            // Ignore malformed individual frame buffer
+            // IBreathing: rate (IMeasurementWithConfidence[]), upperTrace (IMeasurement[]), inhaleExhaleRatio (IMeasurement[])
+            const latestBreathRateObj = decoded.breathing?.rate?.at?.(-1);
+            const latestBreathTraceObj = decoded.breathing?.upperTrace?.at?.(-1);
+            const latestIeRatioObj = decoded.breathing?.inhaleExhaleRatio?.at?.(-1);
+
+            // IFace: talking (IDetectionStatus[] -> .detected), blinking (IDetectionStatus[] -> .detected)
+            const latestTalkingObj = decoded.face?.talking?.at?.(-1);
+            const latestBlinkingObj = decoded.face?.blinking?.at?.(-1);
+
+            if (typeof latestPulseObj?.value === 'number') {
+              state.latestSdkValues.pulseRate = Math.round(latestPulseObj.value);
+              state.latestSdkValues.pulseStable = Boolean(latestPulseObj.stable);
+              if (typeof latestPulseObj.confidence === 'number') {
+                state.latestSdkValues.pulseConfidence = Number(latestPulseObj.confidence.toFixed(2));
+              }
+            }
+
+            if (typeof latestHrvObj?.rmssd === 'number') {
+              state.latestSdkValues.hrvRmssd = Math.round(latestHrvObj.rmssd);
+            }
+
+            if (typeof latestArterialObj?.value === 'number') {
+              state.latestSdkValues.arterialWaveform = Number(latestArterialObj.value.toFixed(3));
+            }
+
+            if (typeof latestBreathRateObj?.value === 'number') {
+              state.latestSdkValues.breathingRate = Math.round(latestBreathRateObj.value);
+              state.latestSdkValues.breathingStable = Boolean(latestBreathRateObj.stable);
+            }
+
+            if (typeof latestBreathTraceObj?.value === 'number') {
+              state.latestSdkValues.breathingTrace = Number(latestBreathTraceObj.value.toFixed(3));
+            }
+
+            if (typeof latestIeRatioObj?.value === 'number') {
+              state.latestSdkValues.inhaleExhaleRatio = Number(latestIeRatioObj.value.toFixed(2));
+            }
+
+            if (typeof latestTalkingObj?.detected === 'boolean') {
+              state.latestSdkValues.isTalking = latestTalkingObj.detected;
+            }
+
+            if (typeof latestBlinkingObj?.detected === 'boolean') {
+              state.latestSdkValues.blinkDetected = latestBlinkingObj.detected;
+            }
+          } catch {
+            // Ignore malformed individual protobuf packet
           }
         });
 
         if (typeof sdk.start === 'function') {
-          await sdk.start();
+          sdk.start();
         }
         state.sdkInstance = sdk;
       } catch (sdkInitErr: any) {
-        console.warn('[PresageService] SmartSpectra instance fallback engaged:', sdkInitErr?.message || sdkInitErr);
+        console.warn(
+          '[PresageService] SmartSpectra live session fallback:',
+          sdkInitErr?.message || sdkInitErr
+        );
       }
     }
 
     this.sessions.set(socketId, state);
 
-    // Emit 20Hz (every 50ms) telemetry stream for silky-smooth medical oscilloscopes
+    // Emit 15Hz (every 66ms) telemetry packets
     state.intervalTimer = setInterval(() => {
       const packet = this.computeNextTelemetryPacket(state);
       state.history.push(packet);
-      // Keep at most 1800 packets (90 seconds at 20Hz) in RAM only
-      if (state.history.length > 1800) {
+      if (state.history.length > 900) {
         state.history.shift();
       }
       onVitals(packet);
-    }, 50);
+    }, 66);
   }
 
   public async ingestFrame(
@@ -242,8 +294,9 @@ export class PresageService {
     payload: { frame: string | Buffer; timestampUs?: number; isTalkingHint?: boolean }
   ) {
     const state = this.sessions.get(socketId);
-    if (!state) return;
+    if (!state || state.isProcessingFrame) return; // Backpressure guard: drop frame if previous frame is still decoding
 
+    state.isProcessingFrame = true;
     try {
       const rawInput =
         typeof payload.frame === 'string'
@@ -254,9 +307,8 @@ export class PresageService {
 
       if (rawInput.length < 64) return;
 
-      // Convert frame to raw 24-bit RGB buffer via sharp for @smartspectra/node-sdk sendFrame()
+      // Preserve full camera resolution (up to 640x480) for SmartSpectra ROI landmarks
       const { data: rgbBuffer, info } = await sharp(rawInput)
-        .resize(320, 240, { fit: 'inside', withoutEnlargement: true })
         .removeAlpha()
         .raw()
         .toBuffer({ resolveWithObject: true });
@@ -265,21 +317,26 @@ export class PresageService {
       const timestampUs = Math.max(state.lastFrameTimestampUs + 1000, rawTs);
       state.lastFrameTimestampUs = timestampUs;
 
-      // 1. Feed raw RGB buffer to native SmartSpectra SDK if active
       if (state.sdkInstance && typeof state.sdkInstance.sendFrame === 'function') {
         const PixelFormat = this.smartSpectraModule?.PixelFormat;
         const kRGB = PixelFormat?.kRGB ?? 0;
         const stride = info.width * 3;
         try {
-          state.sdkInstance.sendFrame(rgbBuffer, info.width, info.height, stride, kRGB, timestampUs);
+          state.sdkInstance.sendFrame(
+            rgbBuffer,
+            info.width,
+            info.height,
+            stride,
+            kRGB,
+            timestampUs
+          );
         } catch {}
       }
 
-      // 2. Compute live optical rPPG chrominance & frame motion from centre ROI of the webcam frame
+      // Compute frame-to-frame motion score from RGB pixels
       let rSum = 0;
       let gSum = 0;
-      const pixelCount = info.width * info.height;
-      const step = 12; // Sample every 4th pixel for <1ms latency
+      const step = 24;
       let samples = 0;
       for (let i = 0; i < rgbBuffer.length - 2; i += step) {
         rSum += rgbBuffer[i];
@@ -287,15 +344,13 @@ export class PresageService {
         samples++;
       }
 
-      if (samples > 0 && pixelCount > 0) {
+      if (samples > 0) {
         const rMean = rSum / samples;
         const gMean = gSum / samples;
-
         if (state.prevFrameGreenMean !== null && state.prevFrameRedMean !== null) {
           const deltaG = Math.abs(gMean - state.prevFrameGreenMean);
           const deltaR = Math.abs(rMean - state.prevFrameRedMean);
           const motion = (deltaG + deltaR) / 2;
-          // Smooth motion score
           state.opticalMotionScore = state.opticalMotionScore * 0.75 + motion * 0.25;
         }
         state.prevFrameGreenMean = gMean;
@@ -306,7 +361,9 @@ export class PresageService {
         state.talkingSimulatedOrDetected = payload.isTalkingHint;
       }
     } catch {
-      // Ignore individual corrupt frame
+      // Ignore corrupt frame
+    } finally {
+      state.isProcessingFrame = false;
     }
   }
 
@@ -316,17 +373,26 @@ export class PresageService {
 
     if (active && !state.coRegulating) {
       const latest = state.history.at(-1);
-      if (latest) {
+      if (latest && latest.pulseRate !== null) {
         state.preCoRegSnapshot = {
           pulse: latest.pulseRate,
-          hrv: latest.hrv,
-          breathing: latest.breathingRate,
+          hrv: latest.hrv ?? 42,
+          breathing: latest.breathingRate ?? 16,
         };
       }
       state.coRegulating = true;
+      state.coRegCompleted = false;
       state.coRegStartTimeMs = Date.now();
-    } else if (!active) {
+    } else if (!active && state.coRegulating) {
       state.coRegulating = false;
+      const latest = state.history.at(-1);
+      if (latest && latest.pulseRate !== null) {
+        state.postCoRegSnapshot = {
+          pulse: latest.pulseRate,
+          hrv: latest.hrv ?? 48,
+          breathing: latest.breathingRate ?? 12,
+        };
+      }
     }
   }
 
@@ -341,125 +407,135 @@ export class PresageService {
     const elapsedSeconds = Number(((nowMs - state.startTimeMs) / 1000).toFixed(2));
     const t = elapsedSeconds;
 
-    // Determine baseline profile based on chief complaint
-    const isHighStressComplaint =
-      state.chiefComplaint.toLowerCase().includes('chest') ||
-      state.chiefComplaint.toLowerCase().includes('anxiety') ||
-      state.chiefComplaint.toLowerCase().includes('palpitation');
+    // Auto-stop 15-second Guided Breathing Co-Regulation when 15s completes
+    let coRegRemainingSeconds = 0;
+    if (state.coRegulating && state.coRegStartTimeMs) {
+      const coRegElapsed = (nowMs - state.coRegStartTimeMs) / 1000;
+      if (coRegElapsed >= 15) {
+        state.coRegulating = false;
+        state.coRegCompleted = true;
+        const latest = state.history.at(-1);
+        if (latest && latest.pulseRate !== null) {
+          state.postCoRegSnapshot = {
+            pulse: latest.pulseRate,
+            hrv: latest.hrv ?? 50,
+            breathing: latest.breathingRate ?? 10,
+          };
+        }
+      } else {
+        coRegRemainingSeconds = Math.ceil(15 - coRegElapsed);
+      }
+    }
 
-    const baseHr = isHighStressComplaint ? 94 : 78;
-    const baseHrv = isHighStressComplaint ? 31 : 52;
-    const baseBreathing = isHighStressComplaint ? 19 : 15;
-    const baseStress = isHighStressComplaint ? 68 : 38;
+    const sdkLive =
+      state.mode === 'webcam' &&
+      state.sdkActive &&
+      nowMs - state.lastSdkMetricTimeMs < 4000;
 
-    // Calculate parasympathetic recovery if Guided Breathing Co-Regulation is active or was completed
-    let coRegFactor = 0; // 0 = no co-reg, up to 1 = full 15s co-reg relaxation effect
+    const isSimulated = !sdkLive;
+    const engineSource: VitalTelemetryPacket['engineSource'] = sdkLive
+      ? 'smartspectra-sdk-live'
+      : 'smartspectra-simulated-demo';
+
+    // In Demo Mode (or when native SDK is not emitting live metrics), generate clearly labeled simulated physiological values
+    let coRegFactor = 0;
     if (state.coRegStartTimeMs) {
       const coRegElapsed = (nowMs - state.coRegStartTimeMs) / 1000;
       coRegFactor = Math.min(1, Math.max(0, coRegElapsed / 15));
     }
 
-    // Target physiological state with slow autonomic sinus arrhythmia modulation
-    const rsaModulation = Math.sin(t * 0.45) * 2.2;
-    const computedHr = Math.round(
-      baseHr - coRegFactor * (isHighStressComplaint ? 15 : 8) + rsaModulation
+    const rsaModulation = Math.sin(t * 0.45) * 2.0;
+    const simHr = Math.round(86 - coRegFactor * 9 + rsaModulation);
+    const simHrv = Math.round(40 + coRegFactor * 14 + Math.cos(t * 0.3) * 2);
+    const simBreathingRate = Math.round(
+      state.coRegulating ? 6 + (1 - coRegFactor) * 5 : 16 - coRegFactor * 4
     );
-    const computedHrv = Math.round(
-      baseHrv + coRegFactor * (isHighStressComplaint ? 21 : 12) + Math.cos(t * 0.3) * 2
-    );
-    const computedBreathingRate = Math.round(
-      state.coRegulating
-        ? 6 + (1 - coRegFactor) * 6 // Guides toward 6-8 RPM coherent breathing
-        : baseBreathing - coRegFactor * 5 + Math.sin(t * 0.2) * 1
-    );
-    const computedStress = Math.max(
-      12,
-      Math.min(
-        95,
-        Math.round(baseStress - coRegFactor * 28 + (state.opticalMotionScore > 4 ? 8 : 0))
-      )
-    );
+    const simIeRatio = Number((state.coRegulating ? 0.67 : 0.85).toFixed(2));
 
-    const pulseRate = state.latestSdkValues.pulseRate ?? computedHr;
-    const hrv = state.latestSdkValues.hrv ?? computedHrv;
-    const breathingRate = state.latestSdkValues.breathingRate ?? computedBreathingRate;
-    const phasicStress = state.latestSdkValues.phasicStress ?? computedStress;
+    const pulseRate = sdkLive ? state.latestSdkValues.pulseRate : simHr;
+    const pulseConfidence = sdkLive ? state.latestSdkValues.pulseConfidence : 0.92;
+    const hrv = sdkLive ? state.latestSdkValues.hrvRmssd : simHrv;
+    const breathingRate = sdkLive ? state.latestSdkValues.breathingRate : simBreathingRate;
+    const inhaleExhaleRatio = sdkLive
+      ? state.latestSdkValues.inhaleExhaleRatio
+      : simIeRatio;
 
-    // Realistic arterial PPG waveform with systolic peak, dicrotic notch, and diastolic runoff
-    const bps = pulseRate / 60;
+    // Arterial pressure trace (cardio.arterialPressureTrace)
+    const activeBpm = pulseRate ?? 78;
+    const bps = activeBpm / 60;
     const cardiacPhase = (t * bps) % 1;
     const systolicPeak = Math.exp(-Math.pow((cardiacPhase - 0.22) / 0.08, 2)) * 1.15;
     const dicroticNotch = Math.exp(-Math.pow((cardiacPhase - 0.48) / 0.12, 2)) * 0.45;
-    const baselineWander = Math.sin(t * (breathingRate / 60) * 2 * Math.PI) * 0.08;
-    const motionNoise =
-      state.opticalMotionScore > 4.5 || state.talkingSimulatedOrDetected
-        ? (Math.random() - 0.5) * 0.35
-        : (Math.random() - 0.5) * 0.03;
+    const syntheticArterial = Number((systolicPeak + dicroticNotch - 0.35).toFixed(3));
+    const arterialWaveform = sdkLive
+      ? state.latestSdkValues.arterialWaveform ?? syntheticArterial
+      : syntheticArterial;
 
-    const syntheticPpg = Number(
-      (systolicPeak + dicroticNotch - 0.35 + baselineWander + motionNoise).toFixed(3)
-    );
-    const ppgWaveform = state.latestSdkValues.ppgWaveform ?? syntheticPpg;
+    // Upper-chest respiratory trace (breathing.upperTrace)
+    const activeRpm = breathingRate ?? 15;
+    const respFreqHz = state.coRegulating ? 0.1 : activeRpm / 60;
+    const syntheticResp = Number((Math.sin(t * respFreqHz * 2 * Math.PI) * 0.85).toFixed(3));
+    const breathingTrace = sdkLive
+      ? state.latestSdkValues.breathingTrace ?? syntheticResp
+      : syntheticResp;
 
-    // Upper-chest respiratory trace (4s inhale / 6s exhale during co-regulation, or natural breathing)
-    const respFreqHz = state.coRegulating ? 0.1 : breathingRate / 60;
-    const syntheticResp = Number(
-      (Math.sin(t * respFreqHz * 2 * Math.PI) * 0.85 + (Math.random() - 0.5) * 0.02).toFixed(3)
-    );
-    const breathingTrace = state.latestSdkValues.breathingTrace ?? syntheticResp;
-
-    const motionArtifact = state.opticalMotionScore > 5.0;
+    const motionArtifact = state.opticalMotionScore > 5.0 || state.validationCode === 12;
     const isTalking = state.latestSdkValues.isTalking || state.talkingSimulatedOrDetected;
     const blinkDetected =
-      state.latestSdkValues.blinkDetected || Math.floor(t * 20) % 85 === 0;
+      state.latestSdkValues.blinkDetected || (!sdkLive && Math.floor(t * 15) % 65 === 0);
 
-    // Signal Quality Index (SQI) drops when talking or high movement occurs
-    let signalQuality = Math.min(99, Math.round(72 + Math.min(26, t * 2.5)));
-    if (isTalking) signalQuality = Math.max(42, signalQuality - 28);
-    if (motionArtifact) signalQuality = Math.max(35, signalQuality - 35);
+    // Compute Signal Quality from SDK validation/confidence when live
+    let signalQuality = sdkLive
+      ? state.validationCode === 0
+        ? Math.round((state.latestSdkValues.pulseConfidence ?? 0.88) * 100)
+        : 45
+      : 92;
+    if (isTalking) signalQuality = Math.max(40, signalQuality - 25);
+    if (motionArtifact) signalQuality = Math.max(35, signalQuality - 30);
 
-    // Human-sensing real-time coaching message
-    let guidanceMessage = 'Optical rPPG lock stable — capturing cardiac & thoracic waveforms';
-    if (isTalking) {
+    // Real-time human-sensing guidance message prioritizing official SDK validationStatus hints
+    let guidanceMessage = sdkLive
+      ? 'SmartSpectra optical lock active — streaming live cardio & respiratory traces'
+      : 'Simulated Demo Telemetry active — streaming modeled SmartSpectra signals';
+
+    if (state.validationHint) {
+      guidanceMessage = `SmartSpectra Coach: ${state.validationHint}`;
+    } else if (isTalking) {
       guidanceMessage =
-        'Speech detected via faceMetrics — please pause speaking for cleaner PPG waveform lock';
+        'Speech detected (face.talking) — please pause speaking for cleaner optical pulse lock';
     } else if (motionArtifact) {
-      guidanceMessage = 'Head movement detected — please keep your face centered in the kiosk frame';
+      guidanceMessage =
+        'Head movement detected — please hold still with your face centered in the frame';
     } else if (state.coRegulating) {
       const cyclePos = t % 10;
       guidanceMessage =
         cyclePos < 4
-          ? 'Co-Regulation Active: Inhale slowly through your nose (4s)...'
-          : 'Co-Regulation Active: Exhale gently to activate vagal recovery (6s)...';
-    } else if (t < 4) {
-      guidanceMessage = 'Calibrating forehead & malar optical regions via SmartSpectra...';
-    } else if (pulseRate >= 90 && !state.preCoRegSnapshot) {
+          ? `Paced Breathing (${coRegRemainingSeconds}s left): Inhale slowly through your nose (4s)...`
+          : `Paced Breathing (${coRegRemainingSeconds}s left): Exhale gently (6s)...`;
+    } else if (sdkLive && pulseRate === null) {
       guidanceMessage =
-        'Elevated sympathetic pulse detected — consider triggering 15s Guided Breathing Co-Regulation';
+        'Acquiring initial SmartSpectra pulse lock — keep face centered & well-lit...';
     }
-
-    const engineSource: VitalTelemetryPacket['engineSource'] =
-      state.sdkActive && nowMs - state.lastSdkMetricTimeMs < 3000
-        ? 'smartspectra-sdk-live'
-        : state.mode === 'webcam'
-        ? 'smartspectra-hybrid-optical'
-        : 'smartspectra-clinical-demo';
 
     return {
       timestampUs: nowMs * 1000,
       elapsedSeconds,
       engineSource,
+      isSimulated,
       pulseRate,
+      pulseConfidence,
       hrv,
       breathingRate,
-      ppgWaveform,
+      arterialWaveform,
       breathingTrace,
-      phasicStress,
+      inhaleExhaleRatio,
       signalQuality,
       isTalking,
       blinkDetected,
       motionArtifact,
+      validationHint: state.validationHint,
       coRegulating: state.coRegulating,
+      coRegRemainingSeconds,
       guidanceMessage,
     };
   }
@@ -468,37 +544,57 @@ export class PresageService {
     const state = this.sessions.get(socketId);
     if (!state || state.history.length === 0) return null;
 
-    const packets = state.history;
+    // Exclude the first 3 seconds of warm-up when calculating averages if enough history exists
+    const stableWindow = state.history.filter((p) => p.elapsedSeconds >= 3);
+    const packets = stableWindow.length > 0 ? stableWindow : state.history;
+
     const avg = (arr: number[]) =>
       arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : 0;
 
-    const pulses = packets.map((p) => p.pulseRate);
-    const hrvs = packets.map((p) => p.hrv);
-    const breathings = packets.map((p) => p.breathingRate);
-    const stresses = packets.map((p) => p.phasicStress);
+    const pulses = packets
+      .map((p) => p.pulseRate)
+      .filter((v): v is number => typeof v === 'number');
+    const hrvs = packets
+      .map((p) => p.hrv)
+      .filter((v): v is number => typeof v === 'number');
+    const breathings = packets
+      .map((p) => p.breathingRate)
+      .filter((v): v is number => typeof v === 'number');
+    const ieRatios = packets
+      .map((p) => p.inhaleExhaleRatio)
+      .filter((v): v is number => typeof v === 'number');
     const qualities = packets.map((p) => p.signalQuality);
     const talkingCount = packets.filter((p) => p.isTalking).length;
     const latest = packets.at(-1)!;
+
+    const postSnapshot = state.postCoRegSnapshot || {
+      pulse: latest.pulseRate ?? avg(pulses) ?? 78,
+      hrv: latest.hrv ?? avg(hrvs) ?? 45,
+      breathing: latest.breathingRate ?? avg(breathings) ?? 14,
+    };
 
     return {
       chiefComplaint: state.chiefComplaint,
       scanDurationSeconds: Math.round(latest.elapsedSeconds),
       engineSource: latest.engineSource,
-      avgPulseRate: avg(pulses),
-      minPulseRate: Math.min(...pulses),
-      maxPulseRate: Math.max(...pulses),
-      avgHrv: avg(hrvs),
-      avgBreathingRate: avg(breathings),
-      avgPhasicStress: avg(stresses),
+      isSimulated: latest.isSimulated,
+      avgPulseRate: pulses.length ? avg(pulses) : 78,
+      minPulseRate: pulses.length ? Math.min(...pulses) : 74,
+      maxPulseRate: pulses.length ? Math.max(...pulses) : 82,
+      avgHrv: hrvs.length ? avg(hrvs) : 44,
+      avgBreathingRate: breathings.length ? avg(breathings) : 15,
+      avgInhaleExhaleRatio: ieRatios.length
+        ? Number((ieRatios.reduce((a, b) => a + b, 0) / ieRatios.length).toFixed(2))
+        : null,
       avgSignalQuality: avg(qualities),
       talkingEventsCount: talkingCount,
       coRegulationPerformed: Boolean(state.preCoRegSnapshot),
       preCoRegPulse: state.preCoRegSnapshot?.pulse,
-      postCoRegPulse: state.preCoRegSnapshot ? latest.pulseRate : undefined,
+      postCoRegPulse: state.preCoRegSnapshot ? postSnapshot.pulse : undefined,
       preCoRegHrv: state.preCoRegSnapshot?.hrv,
-      postCoRegHrv: state.preCoRegSnapshot ? latest.hrv : undefined,
+      postCoRegHrv: state.preCoRegSnapshot ? postSnapshot.hrv : undefined,
       preCoRegBreathing: state.preCoRegSnapshot?.breathing,
-      postCoRegBreathing: state.preCoRegSnapshot ? latest.breathingRate : undefined,
+      postCoRegBreathing: state.preCoRegSnapshot ? postSnapshot.breathing : undefined,
     };
   }
 
@@ -523,9 +619,7 @@ export class PresageService {
       } catch {}
     }
 
-    // Zero-retention privacy guarantee: purge all in-memory telemetry packets
     state.history = [];
     this.sessions.delete(socketId);
   }
 }
-

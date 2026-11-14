@@ -10,7 +10,6 @@ const dotenv_1 = __importDefault(require("dotenv"));
 const socket_io_1 = require("socket.io");
 const PresageService_1 = require("./services/PresageService");
 const GeminiService_1 = require("./services/GeminiService");
-const PaymentService_1 = require("./services/PaymentService");
 dotenv_1.default.config();
 const PORT = Number(process.env.PORT) || 5000;
 const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
@@ -19,7 +18,7 @@ app.use((0, cors_1.default)({
     origin: [FRONTEND_URL, 'http://localhost:5173', 'http://127.0.0.1:5173'],
     credentials: true,
 }));
-app.use(express_1.default.json({ limit: '5mb' }));
+app.use(express_1.default.json({ limit: '1mb' }));
 const server = http_1.default.createServer(app);
 const io = new socket_io_1.Server(server, {
     cors: {
@@ -30,7 +29,8 @@ const io = new socket_io_1.Server(server, {
 });
 const presageService = new PresageService_1.PresageService();
 const geminiService = new GeminiService_1.GeminiService();
-const paymentService = new PaymentService_1.PaymentService();
+// Simple in-memory rate limit for /api/triage (max 10 requests per minute per IP)
+const triageRateMap = new Map();
 // Health & SDK Diagnostics Endpoint
 app.get('/api/health', (_req, res) => {
     res.json({
@@ -38,47 +38,45 @@ app.get('/api/health', (_req, res) => {
         service: 'VitalSync Tele-Triage Kiosk Backend',
         presage: presageService.getStatus(),
         geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
-        privacyPolicy: 'Zero-disk-retention ephemeral RAM pipeline active',
+        privacyPolicy: 'Ephemeral in-memory processing • SDK aggregate telemetry disabled',
     });
 });
-// REST fallback for Triage Generation
+// Validated & Rate-Limited REST fallback for Triage Generation
 app.post('/api/triage', async (req, res) => {
+    const ip = req.ip || 'local';
+    const now = Date.now();
+    const recent = (triageRateMap.get(ip) || []).filter((t) => now - t < 60_000);
+    if (recent.length >= 10) {
+        res.status(429).json({ error: 'Too many triage requests. Please wait a moment.' });
+        return;
+    }
+    recent.push(now);
+    triageRateMap.set(ip, recent);
+    const body = req.body;
+    if (!body || typeof body.avgPulseRate !== 'number' || typeof body.chiefComplaint !== 'string') {
+        res.status(400).json({ error: 'Invalid session summary payload' });
+        return;
+    }
     try {
-        const report = await geminiService.generateTriageReport(req.body);
+        const sanitizedSummary = {
+            ...body,
+            chiefComplaint: String(body.chiefComplaint).slice(0, 240),
+        };
+        const report = await geminiService.generateTriageReport(sanitizedSummary);
         res.json(report);
     }
     catch (err) {
         res.status(500).json({ error: err?.message || 'Failed to generate triage report' });
     }
 });
-// MTN Mobile Money (MoMo) Payment Endpoint
-app.post('/api/payments/momo', async (req, res) => {
-    try {
-        const { phone, country } = req.body || {};
-        const receipt = await paymentService.processMtnMomo(phone, country);
-        res.json(receipt);
-    }
-    catch (err) {
-        res.status(500).json({ error: err?.message || 'MoMo payment failed' });
-    }
-});
-// Stripe Express Checkout Endpoint
-app.post('/api/payments/stripe', async (_req, res) => {
-    try {
-        const receipt = await paymentService.processStripeCheckout(FRONTEND_URL);
-        res.json(receipt);
-    }
-    catch (err) {
-        res.status(500).json({ error: err?.message || 'Stripe checkout failed' });
-    }
-});
 // Real-Time Socket.io Telemetry Pipeline
 io.on('connection', (socket) => {
     console.log(`[Socket.io] Client connected: ${socket.id}`);
     socket.on('session:start', async (options) => {
+        const safeComplaint = String(options?.chiefComplaint || 'Routine Pre-Consultation Check-In').slice(0, 240);
         await presageService.startSession(socket.id, {
-            mode: options?.mode || 'webcam',
-            chiefComplaint: options?.chiefComplaint || 'Routine Tele-Triage Checkup',
+            mode: options?.mode === 'demo' ? 'demo' : 'webcam',
+            chiefComplaint: safeComplaint,
         }, (vitalPacket) => {
             socket.emit('stream:vitals', vitalPacket);
         });
